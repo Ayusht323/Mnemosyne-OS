@@ -1,0 +1,13 @@
+# Python environment
+venv/
+.venv/
+__pycache__/
+*.pyc
+
+# Project Data (DO NOT UPLOAD PERSONAL SCREENSHOTS/DB)
+data/
+*.log
+
+# OS generated files
+.DS_Store
+Thumbs.db

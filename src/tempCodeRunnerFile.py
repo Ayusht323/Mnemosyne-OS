@@ -1,0 +1,5 @@
+# 2. Start The Eye (Capture)
+        print("   - 👁️  Launching Capture Service...")
+        p1 = subprocess.Popen([sys.executable, CAPTURE_SCRIPT])
+        processes.append(p1)
+        time.sleep(1)
