@@ -1,32 +1,29 @@
 import streamlit as st
 import os
 import sys
-import re
-import requests
-import json
 import pandas as pd
 from datetime import datetime
-from PIL import Image
+import subprocess
 
 # Add project root to path
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
+# --- NEW MODULAR IMPORTS ---
 from src.process import VisualCortex
 from src.storage import MemoryBank
+from src.ai import ask_ollama
+from src.search import smart_searcher
 
 # --- CONFIGURATION ---
 st.set_page_config(page_title="Mnemosyne", layout="wide", page_icon="🧠")
-OLLAMA_URL = "http://localhost:11434/api/generate"
-MODEL_NAME = "llama3.2"
-
-STOP_WORDS = {
-    'where', 'did', 'i', 'see', 'saw', 'what', 'was', 'when', 'how', 'who', 
-    'the', 'a', 'an', 'in', 'on', 'at', 'to', 'for', 'of', 'with', 'is', 'are'
-}
 
 @st.cache_resource
 def load_cortex():
     return VisualCortex()
+
+@st.cache_resource
+def load_bank():
+    return MemoryBank()
 
 # --- HELPER: FIND IMAGES ---
 def get_image_path(mem_id):
@@ -74,76 +71,12 @@ def load_all_metadata(bank):
         return pd.DataFrame(data)
     except: return pd.DataFrame()
 
-# --- AI BRAIN (STRICT MODE) ---
-def ask_ollama(question, context, pending_count):
-    prompt = f"""
-    You are Mnemosyne, a factual personal assistant.
-    
-    USER QUESTION: "{question}"
-    
-    SYSTEM STATUS: 
-    - NEW IMAGES PENDING (UNREAD): {pending_count}
-    
-    EVIDENCE FROM PROCESSED MEMORIES:
-    ---------------------
-    {context}
-    ---------------------
 
-    INSTRUCTIONS:
-    1. SEARCH the Evidence for the answer.
-    2. IF found: Answer naturally and cite the [Time: ID].
-    3. IF NOT found AND 'NEW IMAGES PENDING' > 0: 
-       You MUST say: "I don't see '{question}' in your processed history yet, but I see {pending_count} new screenshots currently processing. Please ask again in a moment."
-    4. IF NOT found AND 'NEW IMAGES PENDING' == 0:
-       Say: "I searched your history and couldn't find any record of that."
-    5. DO NOT HALLUCINATE.
-    """
-    
-    payload = {"model": MODEL_NAME, "prompt": prompt, "stream": False, "options": {"temperature": 0.0}}
-    try:
-        res = requests.post(OLLAMA_URL, json=payload)
-        return res.json().get('response', "Empty.") if res.status_code==200 else "Error."
-    except: return "Ollama offline."
-
-# --- SEARCH ENGINE ---
-def smart_searcher(query, bank, cortex):
-    raw_words = re.sub(r'[^\w\s]', '', query).lower().split()
-    keywords = [w for w in raw_words if w not in STOP_WORDS]
-    if not keywords: keywords = [query.lower()]
-
-    text_matches = []
-    try:
-        tbl = bank.db.open_table("memories")
-        rows = tbl.search().limit(2000).to_list() 
-        for row in rows:
-            row_text = re.sub(r'[^\w\s]', '', row.get('text', '')).lower()
-            for kw in keywords:
-                if kw in row_text:
-                    row['type'] = 'TEXT'
-                    row['matched_keyword'] = kw
-                    text_matches.append(row)
-                    break 
-    except: pass
-
-    visual_matches = []
-    vec = cortex.embed_text(query)
-    if vec:
-        v_rows = bank.search_memory(vec, limit=15)
-        for r in v_rows:
-            r['type'] = 'VISUAL'
-            visual_matches.append(r)
-            
-    seen = set()
-    final = []
-    for r in text_matches + visual_matches:
-        if r['id'] not in seen: final.append(r); seen.add(r['id'])
-    return final, keywords
-
-# --- COMPONENT: TIMELINE (FIXED: ALWAYS SLIDER) ---
+# --- COMPONENT: TIMELINE ---
 @st.fragment(run_every=5) 
 def render_timeline():
     st.header("Rewind Your Day")
-    bank = MemoryBank()
+    bank = load_bank()
     df = load_all_metadata(bank)
     
     if df.empty:
@@ -158,12 +91,18 @@ def render_timeline():
 
     count = len(day_data)
     
-    # --- SLIDER LOGIC ---
     if "timeline_idx" not in st.session_state: st.session_state.timeline_idx = count - 1
     if st.session_state.timeline_idx >= count: st.session_state.timeline_idx = count - 1
 
-    selected_idx = st.slider("Scrub Time", 0, count - 1, st.session_state.timeline_idx, key="timeline_slider")
-    st.session_state.timeline_idx = selected_idx
+    # THE FIX: Only show the slider if we have more than 1 image!
+    if count > 1:
+        selected_idx = st.slider("Scrub Time", 0, count - 1, st.session_state.timeline_idx, key="timeline_slider")
+        st.session_state.timeline_idx = selected_idx
+    else:
+        st.session_state.timeline_idx = 0
+        st.info("Only 1 memory recorded so far today.")
+
+    memory_row = day_data.iloc[st.session_state.timeline_idx]
 
     memory_row = day_data.iloc[st.session_state.timeline_idx]
     mem_id = memory_row['id']
@@ -184,8 +123,6 @@ def render_timeline():
         if c2.button("⏩"): 
             st.session_state.timeline_idx = min(count - 1, st.session_state.timeline_idx + 1); st.rerun()
         
-        # --- HERE IS THE CONTENT BOX YOU MISSED ---
-        # It is now available regardless of how many images you have.
         st.subheader("Extracted Content:")
         st.text_area("OCR Output", memory_row.get('text_preview', ''), height=300, label_visibility="collapsed")
 
@@ -193,7 +130,7 @@ def render_timeline():
 @st.fragment(run_every=10)
 def render_dashboard():
     st.header("Productivity Analytics")
-    bank = MemoryBank()
+    bank = load_bank()
     df = load_all_metadata(bank)
     if not df.empty:
         hourly = df['hour'].value_counts().sort_index().reindex(range(24), fill_value=0)
@@ -201,14 +138,50 @@ def render_dashboard():
         st.dataframe(df[['datetime', 'text_preview']].sort_values('datetime', ascending=False))
     else: st.info("No data.")
 
+
+# ==========================================
+# --- SIDEBAR CONTROLS (THE NEW CAPTURE LOGIC) ---
+# ==========================================
+st.sidebar.title("⚙️ Engine Controls")
+
+if 'capture_proc' not in st.session_state:
+    st.session_state.capture_proc = None
+
+col1, col2 = st.sidebar.columns(2)
+
+with col1:
+    if st.button("▶️ Start Sentinel"):
+        if st.session_state.capture_proc is None:
+            st.session_state.capture_proc = subprocess.Popen([sys.executable, "src/capture.py"])
+            st.toast("📸 Screen Sentinel Activated!")
+        else:
+            st.toast("⚠️ Sentinel is already running!")
+
+with col2:
+    if st.button("⏹️ Stop"):
+        if st.session_state.capture_proc is not None:
+            st.session_state.capture_proc.terminate()
+            st.session_state.capture_proc = None
+            st.toast("🛑 Sentinel Deactivated.")
+        else:
+            st.toast("⚠️ Sentinel is not running.")
+
+if st.session_state.capture_proc is not None:
+    st.sidebar.success("🟢 Sentinel is ACTIVE")
+else:
+    st.sidebar.error("🔴 Sentinel is OFFLINE")
+
+
+# ==========================================
 # --- MAIN APP LAYOUT ---
+# ==========================================
 st.title("🧠 Mnemosyne OS")
 tab1, tab2, tab3, tab4 = st.tabs(["🔍 Search", "💬 Chat", "⏳ Time Travel", "📊 Dashboard"])
 
 with tab1:
     q = st.text_input("Find Screenshot:", placeholder="jarvis")
     if q:
-        bank = MemoryBank()
+        bank = load_bank()
         cortex = load_cortex()
         results, kws = smart_searcher(q, bank, cortex)
         if results:
@@ -234,11 +207,11 @@ with tab2:
         with st.chat_message("user"): st.markdown(prompt)
         with st.chat_message("assistant"):
             st.markdown("Thinking...")
-            bank = MemoryBank()
+            bank = load_bank()
             cortex = load_cortex()
             
             items, _ = smart_searcher(prompt, bank, cortex)
-            context = "\n".join([f"[Time: {i['id']}] {i.get('text','')}" for i in items[:10]])
+            context = [f"[Time: {i['id']}] {i.get('text','')}" for i in items[:10]]
             
             last_db_id = None
             if items: last_db_id = sorted([i['id'] for i in items])[-1]

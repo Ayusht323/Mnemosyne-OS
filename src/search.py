@@ -1,48 +1,50 @@
 import sys
 import os
+import re
 
-# Fix import path
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
-
-from src.process import VisualCortex
 from src.storage import MemoryBank
 
-def main():
-    # 1. Get Query from User
-    if len(sys.argv) < 2:
-        print("Usage: python src/search.py 'your search query'")
-        return
-    
-    query = sys.argv[1]
-    print(f"🔍 Searching for: '{query}'...")
+STOP_WORDS = {'where', 'did', 'i', 'see', 'saw', 'what', 'was', 'when', 'how', 'who', 'the', 'a', 'in', 'on', 'at', 'to', 'for', 'of', 'with', 'is', 'are'}
 
-    # 2. Convert Query to Vector (The "Meaning")
-    cortex = VisualCortex()
-    query_vector = cortex.embed_text(query)
+def smart_searcher(query, bank, cortex):
+    raw_words = re.sub(r'[^\w\s]', '', query).lower().split()
+    keywords = [w for w in raw_words if w not in STOP_WORDS] or [query.lower()]
     
-    if not query_vector:
-        print("❌ Failed to vectorize query.")
-        return
+    text_matches = []
+    try:
+        rows = bank.db.open_table("memories").search().limit(2000).to_list() 
+        for row in rows:
+            row_text = re.sub(r'[^\w\s]', '', row.get('text', '')).lower()
+            for kw in keywords:
+                if kw in row_text:
+                    row['type'], row['matched_keyword'] = 'TEXT', kw
+                    text_matches.append(row)
+                    break 
+    except: pass
 
-    # 3. Search Database
-    bank = MemoryBank()
-    results = bank.search_memory(query_vector, limit=3)
-
-    # 4. Show Results
-    print(f"\n✅ Found {len(results)} matches:\n")
-    
-    for i, res in enumerate(results):
-        # Calculate similarity score (LanceDB returns distance, lower is better usually, 
-        # but for Cosine it depends on implementation. We just show raw data for now.)
-        
-        # 'res' is a dictionary-like object from LanceDB
-        timestamp = res['id']
-        text_snippet = res['text'][:100].replace('\n', ' ')
-        
-        print(f"match #{i+1} | ID: {timestamp}")
-        print(f"   📄 Text Content: {text_snippet}...")
-        print(f"   🖼️  File: {res['file_path']}")
-        print("-" * 40)
+    visual_matches = []
+    vec = cortex.embed_text(query)
+    if vec:
+        for r in bank.search_memory(vec, limit=15):
+            r['type'] = 'VISUAL'
+            visual_matches.append(r)
+            
+    seen = set()
+    final = []
+    for r in text_matches + visual_matches:
+        if r['id'] not in seen:
+            final.append(r)
+            seen.add(r['id'])
+            
+    return final, keywords
 
 if __name__ == "__main__":
-    main()
+    from src.process import VisualCortex
+    if len(sys.argv) < 2:
+        print("Usage: python src/search.py 'your search query'")
+        sys.exit()
+    query = sys.argv[1]
+    print(f"🔍 Searching for: '{query}'...")
+    res, _ = smart_searcher(query, MemoryBank(), VisualCortex())
+    print(f"\n✅ Found {len(res)} matches.\n")
